@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       folder_id:
-        description: "Google Drive Folder ID"
-        required: true
+        description: "গুগল ড্রাইভ ফোল্ডার আইডি (ফাঁকা রাখলে সিক্রেটস থেকে অটো নেবে)"
+        required: false
         default: ""
 
 jobs:
@@ -48,12 +48,18 @@ jobs:
           RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG_BASE64 }}
           OLLAMA_API_KEYS: ${{ secrets.OLLAMA_API_KEYS }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SECRET_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID || secrets.DEFAULT_GDRIVE_FOLDER_ID }}
         run: |
-          TARGET="${{ github.event.inputs.folder_id }}"
-          if [ -z "$TARGET" ]; then
-            TARGET="${{ secrets.DEFAULT_GDRIVE_FOLDER_ID }}"
+          # যদি বক্সে কিছু না লেখেন, তবে সরাসরি GitHub Secrets থেকে আইডি নেবে
+          INPUT_ID="${{ github.event.inputs.folder_id }}"
+          TARGET_FOLDER="${INPUT_ID:-$SECRET_FOLDER_ID}"
+
+          if [ -z "$TARGET_FOLDER" ]; then
+            echo "ERROR: কোনো ফোল্ডার আইডি পাওয়া যায়নি! সিক্রেটসে GDRIVE_FOLDER_ID নিশ্চিত করুন।"
+            exit 1
           fi
-          python pipeline.py --folder-id "$TARGET"
+
+          python pipeline.py --folder-id "$TARGET_FOLDER"
 
       - name: Upload Debug Artifacts on Failure
         if: failure()
