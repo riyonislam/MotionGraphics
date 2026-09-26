@@ -1,7 +1,8 @@
 """
 modules/ollama_client.py
-Ollama Cloud API client with resilient round-robin multi-key rotation.
-Optimized for long-form battle documentaries (20+ minutes) and strict aniconism.
+Official Ollama Cloud API Client.
+Prioritizes gemma4:31b, falls back to token-efficient models,
+and reserves heavy models as quality-preserving backstops.
 """
 
 import json
@@ -13,51 +14,68 @@ from typing import List, Dict, Any
 
 logger = logging.getLogger("OllamaClient")
 
+# স্মার্ট ক্রমানুসারে সাজানো Ollama Cloud মডেল তালিকা (টোকেন সাশ্রয়ী ও হাই-কোয়ালিটি)
+ORDERED_CLOUD_MODELS = [
+    "gemma4:31b",           # ১. সর্বপ্রথম চেষ্টা হবে (User's #1 Priority: Fast, Smart, Low Token)
+    "deepseek-v4.1-flash",  # ২. সেকেন্ড চয়েস (সুপার ফাস্ট ফ্লাশ আর্কিটেকচার, কম টোকেন)
+    "glm-5.3-flash",        # ৩. ১৮বি লাইটওয়েট ফ্রন্টিয়ার মডেল (মিনিমাল টোকেন খরচ)
+    "gpt-oss:20b",          # ৪. ২০বি কমপ্যাক্ট রিজনিং মডেল
+    "gemma4:cloud",         # ৫. ক্লাউড অ্যালিয়াস ট্যাগ
+    "gpt-oss:120b",         # ৬. হেভি মডেল (টোকেন বেশি খাবে কিন্তু কোয়ালিটি সেরা)
+    "deepseek-v4-pro",      # ৭. ফ্ল্যাগশিপ প্রো রিজনিং মডেল
+    "glm-5.3"               # ৮. লার্জ ক্যাপাসিটি মডেল
+]
+
 class OllamaCloudRotator:
     def __init__(self, api_keys_raw: str, model: str = None):
         self.api_keys: List[str] = [k.strip() for k in api_keys_raw.splitlines() if k.strip()]
         if not self.api_keys:
             raise ValueError("কোনো Ollama Cloud API Key পাওয়া যায়নি।")
-        self.current_index = 0
-        # Default to llama3.3:70b or configurable via env
-        self.model = model or os.getenv("OLLAMA_MODEL", "llama3.3:70b")
+        self.current_key_idx = 0
+        self.preferred_model = model or os.getenv("OLLAMA_MODEL")
+        self.base_url = "https://ollama.com"
         
-        # Official Ollama Cloud Endpoints
-        self.endpoints = [
-            "https://ollama.com/api/chat",            # Native Ollama Cloud
-            "https://ollama.com/v1/chat/completions"  # OpenAI Compatibility Mode
-        ]
+        # Endpoints
+        self.endpoint_native = f"{self.base_url}/api/chat"
+        self.endpoint_openai = f"{self.base_url}/v1/chat/completions"
 
     def _get_active_key(self) -> str:
-        return self.api_keys[self.current_index]
+        return self.api_keys[self.current_key_idx]
 
-    def _rotate(self) -> None:
-        old_idx = self.current_index
-        self.current_index = (self.current_index + 1) % len(self.api_keys)
-        logger.warning(f"Ollama API Key পরিবর্তন করা হচ্ছে: {old_idx} -> {self.current_index}")
+    def _rotate_key(self) -> None:
+        old_idx = self.current_key_idx
+        self.current_key_idx = (self.current_key_idx + 1) % len(self.api_keys)
+        logger.warning(f"🔄 রেট লিমিট বা কি এরর! API Key পরিবর্তন: {old_idx} -> {self.current_key_idx}")
+
+    def get_candidate_models(self) -> List[str]:
+        """User preferred model first, then the token-optimized ordered list."""
+        candidates = []
+        if self.preferred_model:
+            candidates.append(self.preferred_model)
+        for m in ORDERED_CLOUD_MODELS:
+            if m not in candidates:
+                candidates.append(m)
+        return candidates
 
     def generate_battle_plan(self, script_text: str, total_duration: float) -> List[Dict[str, Any]]:
-        """
-        Ollama Cloud-এর মাধ্যমে সম্পূর্ণ ভিডিওর ট্যাকটিক্যাল ম্যাপ প্ল্যান তৈরি করে।
-        """
         # ২২ মিনিটের ভিডিওর জন্য ১৫-২০টি মূল ঐতিহাসিক পর্যায়
         num_scenes = max(10, min(25, int(total_duration // 60)))
         avg_scene_duration = round(total_duration / num_scenes, 2)
 
         system_prompt = (
-            "You are a master tactical cartographer for grand historical battle documentary animations.\n"
-            "CRITICAL CONSTRAINTS (STRICT ANICONISM):\n"
-            "1. NEVER depict, draw, or render living creatures (NO humans, NO faces, NO soldiers, NO animals).\n"
-            "2. Armies are represented ONLY by geometric formations of dots: 'white' (Faction 1) or 'black' (Faction 2).\n"
+            "You are a master military cartographer for historical documentary animations (Circle/Star particle map style).\n"
+            "STRICT CONSTRAINTS (ANICONISM):\n"
+            "1. NEVER render living creatures (NO humans, NO faces, NO animals).\n"
+            "2. Armies are represented ONLY by formations of dots: 'white' (Faction 1) or 'black' (Faction 2).\n"
             "3. Commanders are represented ONLY by a glowing 'star'.\n"
-            f"4. The entire video lasts {total_duration:.2f} seconds. Divide it into exactly {num_scenes} strategic scenes.\n"
-            f"5. Each scene must have a duration of approximately {avg_scene_duration} seconds so the sum equals {total_duration:.2f}s.\n"
+            f"4. The video lasts {total_duration:.2f} seconds. Divide it into exactly {num_scenes} strategic scenes.\n"
+            f"5. Each scene duration must be approximately {avg_scene_duration} seconds.\n"
             "Return ONLY valid JSON matching this schema:\n"
             "[\n"
             "  {\n"
             "    \"scene_id\": 1,\n"
             f"    \"duration\": {avg_scene_duration},\n"
-            "    \"phase_title\": \"Deployment of Armies\",\n"
+            "    \"phase_title\": \"Deployment & Terrain Analysis\",\n"
             "    \"sfx_cue\": \"drums\",\n"
             "    \"camera_focus\": {\"pos\": [0, 0, 0], \"zoom\": 1.0},\n"
             "    \"formations\": [\n"
@@ -72,77 +90,94 @@ class OllamaCloudRotator:
             "]"
         )
 
-        # স্ক্রিপ্টের মূল অংশ এআই-কে সংক্ষেপিত আকারে পাঠানো (যাতে প্রম্পট সাইজ অতিরিক্ত বড় না হয়)
         script_summary = script_text[:8000] if len(script_text) > 8000 else script_text
         user_prompt = (
-            f"Battle Script Overview:\n\"\"\"{script_summary}\"\"\"\n\n"
-            f"Total Narration Duration: {total_duration:.2f} seconds.\n"
-            f"Generate a strategic battle progression with {num_scenes} sequential scenes covering the entire duration."
+            f"Battle Script Narrative:\n\"\"\"{script_summary}\"\"\"\n\n"
+            f"Total Duration: {total_duration:.2f} seconds.\n"
+            f"Output the tactical progression covering all {num_scenes} phases in valid JSON."
         )
 
-        attempts = 0
-        max_attempts = len(self.api_keys) * len(self.endpoints) * 2
+        models_to_try = self.get_candidate_models()
+        logger.info(f"📋 ট্রাই করার জন্য মডেল সিকোয়েন্স: {models_to_try}")
 
-        while attempts < max_attempts:
-            active_key = self._get_active_key()
-            headers = {
-                "Authorization": f"Bearer {active_key}",
-                "Content-Type": "application/json"
-            }
+        for model_name in models_to_try:
+            logger.info(f"\n=======================================================")
+            logger.info(f"🤖 মডেল দিয়ে চেষ্টা করা হচ্ছে: [{model_name}]")
+            logger.info(f"=======================================================")
 
-            for endpoint in self.endpoints:
-                logger.info(f"Ollama Cloud কল করা হচ্ছে: {endpoint} (Key Index: {self.current_index}, Model: {self.model})...")
+            # এই মডেলের জন্য উপলব্ধ সবগুলো কি দিয়ে চেষ্টা করা হবে
+            keys_attempted = 0
+            while keys_attempted < len(self.api_keys):
+                active_key = self._get_active_key()
+                headers = {
+                    "Authorization": f"Bearer {active_key}",
+                    "Content-Type": "application/json"
+                }
 
-                if "/api/chat" in endpoint:
-                    # Native Ollama API
-                    payload = {
-                        "model": self.model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        "stream": False,
-                        "format": "json"
-                    }
-                else:
-                    # OpenAI Compatible API
-                    payload = {
-                        "model": self.model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        "response_format": {"type": "json_object"}
-                    }
+                # ১. প্রথমে অফিসিয়াল Native Ollama Cloud API ট্রাই
+                native_payload = {
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "stream": False,
+                    "format": "json"
+                }
 
                 try:
-                    response = requests.post(endpoint, headers=headers, json=payload, timeout=180)
+                    logger.info(f"কল করা হচ্ছে: {self.endpoint_native} | Model: {model_name} | Key Index: {self.current_key_idx}")
+                    resp = requests.post(self.endpoint_native, headers=headers, json=native_payload, timeout=180)
 
-                    if response.status_code == 200:
-                        res_json = response.json()
-                        if "message" in res_json and "content" in res_json["message"]:
-                            content = res_json["message"]["content"]
-                        elif "choices" in res_json:
-                            content = res_json["choices"][0]["message"]["content"]
-                        else:
-                            content = str(res_json)
-                        
-                        logger.info("✅ Ollama Cloud থেকে সফলভাবে ট্যাকটিক্যাল প্ল্যান তৈরি হয়েছে!")
+                    if resp.status_code == 200:
+                        content = resp.json()["message"]["content"]
+                        logger.info(f"🎉 সাফল্য! মডেল [{model_name}] সফলভাবে ট্যাকটিক্যাল প্ল্যান তৈরি করেছে!")
                         return self._parse_json_response(content, total_duration)
 
-                    elif response.status_code in [401, 403, 429]:
-                        logger.warning(f"Key {self.current_index} লিমিট শেষ বা অথেন্টিকেশন এরর ({response.status_code})। পরবর্তী কি-তে যাওয়া হচ্ছে।")
-                        self._rotate()
-                        break
+                    elif resp.status_code == 404:
+                        logger.warning(f"⚠️ মডেল [{model_name}] পাওয়া যায়নি (404 Not Found)। সরাসরি পরবর্তী মডেলে যাচ্ছি...")
+                        break  # ব্রেক করে সরাসরি পরবর্তী মডেলে চলে যাবে
+
+                    elif resp.status_code in [401, 403, 429]:
+                        logger.warning(f"⚠️ Key {self.current_key_idx} রেট লিমিট বা অথ এরর ({resp.status_code})। কি রোটেট হচ্ছে...")
+                        self._rotate_key()
+                        keys_attempted += 1
+                        continue
+
                     else:
-                        logger.warning(f"Endpoint {endpoint} রেসপন্স কোড {response.status_code}: {response.text[:150]}")
+                        logger.warning(f"অপ্রত্যাশিত কোড {resp.status_code}: {resp.text[:150]}")
 
                 except requests.RequestException as e:
-                    logger.warning(f"Network error on {endpoint}: {e}")
+                    logger.warning(f"কানেকশন এরর on {model_name}: {e}")
 
-            attempts += 1
+                # ২. যদি Native ফেল করে, তবে OpenAI Compatibility মোড ট্রাই
+                openai_payload = {
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "response_format": {"type": "json_object"}
+                }
 
-        raise RuntimeError("সবগুলো Ollama Cloud API Key এবং এন্ডপয়েন্ট ব্যর্থ হয়েছে। দয়া করে আপনার OLLAMA_API_KEYS যাচাই করুন।")
+                try:
+                    resp_openai = requests.post(self.endpoint_openai, headers=headers, json=openai_payload, timeout=180)
+                    if resp_openai.status_code == 200:
+                        content = resp_openai.json()["choices"][0]["message"]["content"]
+                        logger.info(f"🎉 সাফল্য (OpenAI Mode)! মডেল [{model_name}] দিয়ে প্ল্যান তৈরি সম্পন্ন হয়েছে।")
+                        return self._parse_json_response(content, total_duration)
+                    elif resp_openai.status_code == 404:
+                        break
+                    elif resp_openai.status_code in [401, 403, 429]:
+                        self._rotate_key()
+                        keys_attempted += 1
+                        continue
+                except requests.RequestException:
+                    pass
+
+                keys_attempted += 1
+
+        raise RuntimeError("সবগুলো Ollama Cloud মডেল ও API Key চেষ্টা করা হয়েছে কিন্তু প্ল্যান তৈরি করা যায়নি।")
 
     def _parse_json_response(self, raw_str: str, total_duration: float) -> List[Dict[str, Any]]:
         cleaned = re.sub(r"^```(?:json)?", "", raw_str.strip(), flags=re.MULTILINE)
@@ -157,7 +192,6 @@ class OllamaCloudRotator:
             else:
                 data = [data]
 
-        # সময়কাল যাতে হুবহু অডিওর সাথে মিলে যায় তা নিশ্চিত করা
         total_assigned = sum(float(s.get("duration", 10.0)) for s in data)
         if total_assigned > 0:
             scale = total_duration / total_assigned
